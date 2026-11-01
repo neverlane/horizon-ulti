@@ -203,6 +203,7 @@ fn the_whole_chain() {
                 "slim".into()
             )),
             cape: Some("http://textures.minecraft.net/texture/cape2".into()),
+            has_profile: true,
         }
     );
     assert_eq!(secrets.minecraft_token, "mc-token");
@@ -239,6 +240,7 @@ fn notch() -> Account {
         name: "Notch".into(),
         skin: None,
         cape: None,
+        has_profile: true,
     }
 }
 
@@ -332,25 +334,45 @@ fn an_owner_plays_with_a_session() {
 }
 
 #[test]
-fn a_no_from_the_services_blocks_at_once() {
+fn an_owner_without_a_profile_plays_offline() {
+    let (_, ep) = mock(|m| m.no_profile = true);
+    let tokens = MsTokens {
+        access: "ms-access-1".into(),
+        refresh: "ms-refresh-1".into(),
+    };
+    let (account, secrets) = finish_sign_in(&ep, tokens).unwrap();
+    assert!(!account.has_profile && secrets.owns);
+    assert!(account.name.starts_with("Player"));
+    assert_eq!(account.uuid.len(), 32);
+
+    let store = MemoryStore::default();
+    let mut accounts = Accounts::default();
+    accounts.add(&store, account, &secrets).unwrap();
+    let expected_uuid = accounts.selected().unwrap().uuid.clone();
+    let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    assert!(pass.session.is_none());
+    assert_eq!(pass.owner.unwrap().0.uuid, expected_uuid);
+    assert_eq!(
+        accounts.name_arg(),
+        accounts.selected().map(|a| a.name.as_str())
+    );
+
+    // The generated identity is reused, not regenerated on every launch.
+    let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    assert_eq!(pass.owner.unwrap().0.uuid, expected_uuid);
+}
+
+#[test]
+fn a_no_from_the_services_still_plays_offline() {
     let (_, ep) = mock(|m| m.owns_game = false);
     let store = MemoryStore::default();
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     assert!(accounts.has_owner(&store));
-    assert_eq!(
-        launch(&ep, Some("test-client"), &store, &mut accounts).unwrap_err(),
-        NoOwner
-    );
+    let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none());
     // The answer is kept beside the tokens: offline now, it still says no.
     assert!(!kept(&store).owns && !accounts.has_owner(&store));
-    assert_eq!(
-        launch(&offline(), Some("test-client"), &store, &mut accounts).unwrap_err(),
-        NoOwner
-    );
-    assert_eq!(
-        NoOwner.to_string(),
-        "Sign in with a Microsoft account that owns Minecraft: Java Edition to play."
-    );
+    assert!(launch(&offline(), Some("test-client"), &store, &mut accounts).is_ok());
 }
 
 #[test]
@@ -369,9 +391,10 @@ fn no_network_never_blocks_a_past_owner() {
     let mut accounts = signed_in(&store, &stale);
     assert!(launch(&offline(), Some("test-client"), &store, &mut accounts).is_ok());
     assert!(launch(&offline(), None, &store, &mut accounts).is_ok());
-    // An account that never passed doesn't pass offline.
+    // An account that never passed still plays without an online session.
     let mut accounts = signed_in(&store, &secrets("mc-token", false));
-    assert!(launch(&offline(), Some("test-client"), &store, &mut accounts).is_err());
+    let pass = launch(&offline(), Some("test-client"), &store, &mut accounts).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none());
 }
 
 #[test]
@@ -391,6 +414,7 @@ fn any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session() {
         name: "Alex".into(),
         skin: None,
         cape: None,
+        has_profile: true,
     });
     accounts.selected = Some("other".into());
     let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
@@ -406,31 +430,28 @@ fn any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session() {
     let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
     assert!(pass.session.is_none() && pass.offline.is_none());
     assert_eq!(m.lock().unwrap().log.len(), 2);
-    // No account at all.
-    assert!(launch(&ep, Some("test-client"), &store, &mut Accounts::default()).is_err());
+    // No account at all: the game's generated offline identity plays.
+    let pass = launch(&ep, Some("test-client"), &store, &mut Accounts::default()).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none() && pass.offline.is_none());
 }
 
 #[test]
-fn offline_names_play_only_beside_an_owner() {
+fn offline_names_play_without_an_owner() {
     let store = MemoryStore::default();
     let mut accounts = Accounts::default();
-    let refused = accounts.play_as(&store, Player::Offline("Builder_1".into()));
-    assert_eq!(refused.unwrap_err(), OFFLINE_NEEDS_OWNER);
-    assert!(accounts.offline.is_empty());
-    let mut accounts = signed_in(&store, &secrets("mc-token", true));
     accounts
         .play_as(&store, Player::Offline("Builder_1".into()))
         .unwrap();
-    // Signing the last owner out keeps the name, which no longer plays.
-    accounts.remove(&store, UUID).unwrap();
     assert_eq!(accounts.offline, ["Builder_1"]);
     assert_eq!(accounts.player(), Player::Offline("Builder_1".into()));
     assert!(!accounts.has_owner(&store));
     let (_, ep) = mock(|_| {});
-    assert!(launch(&ep, Some("test-client"), &store, &mut accounts).is_err());
-    assert!(accounts
+    let pass = launch(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    assert!(pass.session.is_none() && pass.owner.is_none());
+    accounts
         .play_as(&store, Player::Offline("Builder_2".into()))
-        .is_err());
+        .unwrap();
+    assert_eq!(accounts.name_arg(), Some("Builder_2"));
 }
 
 #[test]
@@ -449,10 +470,6 @@ fn refusals_have_messages() {
         .contains("child account"));
     let (_, ep) = mock(|m| m.owns_game = false);
     assert_eq!(finish_sign_in(&ep, tokens()).unwrap_err(), DOES_NOT_OWN);
-    let (_, ep) = mock(|m| m.no_profile = true);
-    assert!(finish_sign_in(&ep, tokens())
-        .unwrap_err()
-        .contains("no Minecraft profile"));
     assert_eq!(
         oauth_error(&json!({"error": "authorization_declined"})),
         "Sign-in was declined in the browser."
@@ -483,6 +500,7 @@ fn accounts_keep_secrets_in_the_store_only() {
         name: "Notch".into(),
         skin: None,
         cape: None,
+        has_profile: true,
     };
     let secrets = Secrets {
         refresh_token: "r".into(),
@@ -547,6 +565,7 @@ fn session_files_are_private_and_complete() {
         name: "Notch".into(),
         skin: None,
         cape: None,
+        has_profile: true,
     };
     let secrets = Secrets {
         refresh_token: "r".into(),
@@ -604,6 +623,7 @@ fn offline_names_switch_with_accounts() {
             name: "Ludo".into(),
             skin: None,
             cape: None,
+            has_profile: true,
         }],
         selected: Some("abc".into()),
         ..Accounts::default()

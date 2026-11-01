@@ -5,12 +5,12 @@
 //! reads once (`--session-file`), never on its command line. Tokens never reach logs, errors or
 //! output.
 //!
-//! The owner gate ([`launch`]): the launcher starts the game only while an account in it owns
-//! Minecraft: Java Edition, as other launchers do. Offline names play behind such an account.
-//! The game binary itself, its harnesses and the servers don't go through the launcher's gate.
+//! Microsoft sign-in is optional: without an account the launcher plays with the game's generated
+//! offline identity. An offline name can also be selected without signing in.
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
 //! build time, or at run time to override it. Without one, sign-in says it is not configured.
+use md5::Digest;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,13 +21,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const SERVICE: &str = "dev.playhorizon.launcher";
 const SCOPE: &str = "XboxLive.signin offline_access";
 pub const NOT_CONFIGURED: &str =
-    "This build of the launcher has no Microsoft sign-in (HORIZON_MSA_CLIENT_ID), so it can't start the game.";
+    "Microsoft sign-in is not configured (HORIZON_MSA_CLIENT_ID). Offline play is available.";
 /// What every Play says while no account in the launcher owns the game.
 pub const NEEDS_OWNER: &str =
     "Sign in with a Microsoft account that owns Minecraft: Java Edition to play";
 const DOES_NOT_OWN: &str = "This account doesn't own Minecraft: Java Edition.";
-const NO_PROFILE: &str =
-    "This account has no Minecraft profile yet. Create one at minecraft.net, then sign in again.";
 const OTHER_PROFILE: &str =
     "The Microsoft account now has another Minecraft profile. Sign in again.";
 const SIGN_IN_AGAIN: &str = "Your Microsoft sign-in expired. Sign in again.";
@@ -403,6 +401,13 @@ pub struct Account {
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+    /// False for an owner who has not created a Minecraft profile yet and plays offline.
+    #[serde(default = "has_profile")]
+    pub has_profile: bool,
+}
+
+fn has_profile() -> bool {
+    true
 }
 
 /// The profile; none when the account has none (it doesn't own the game, or never made one).
@@ -442,7 +447,26 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, String> {
             ))
         }),
         cape: active("capes").and_then(|c| str_field(&c, "url")),
+        has_profile: true,
     }))
+}
+
+/// A stable offline identity for an account that owns Java but has no Minecraft profile yet.
+fn offline_account(previous: Option<&Account>) -> Account {
+    let name = previous.map_or_else(
+        || format!("Player{:05}", now() % 100_000),
+        |a| a.name.clone(),
+    );
+    let mut hash: [u8; 16] = md5::Md5::digest(format!("OfflinePlayer:{name}").as_bytes()).into();
+    hash[6] = (hash[6] & 0x0f) | 0x30;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    Account {
+        uuid: hash.iter().map(|byte| format!("{byte:02x}")).collect(),
+        name,
+        skin: None,
+        cape: None,
+        has_profile: false,
+    }
 }
 
 /// What the keychain keeps for one account.
@@ -474,7 +498,10 @@ pub fn finish_sign_in(ep: &Endpoints, ms: MsTokens) -> Result<(Account, Secrets)
     if !owns_game(ep, &mc.token)? {
         return Err(DOES_NOT_OWN.into());
     }
-    let account = profile(ep, &mc.token)?.ok_or(NO_PROFILE)?;
+    let account = match profile(ep, &mc.token)? {
+        Some(account) => account,
+        None => offline_account(None),
+    };
     Ok((account, Secrets::new(ms.refresh, mc)))
 }
 
@@ -520,20 +547,30 @@ fn check(ep: &Endpoints, client_id: Option<&str>, account: &Account, secrets: Se
         }
     }
     let token = &secrets.minecraft_token;
-    match owns_game(ep, token).and_then(|owns| Ok(if owns { profile(ep, token)? } else { None })) {
+    match owns_game(ep, token) {
         Err(e) => Check::NoAnswer(e, secrets),
-        Ok(None) => Check::DoesNot(Secrets {
+        Ok(false) => Check::DoesNot(Secrets {
             owns: false,
             ..secrets
         }),
-        Ok(Some(p)) if p.uuid != account.uuid => Check::NoAnswer(OTHER_PROFILE.into(), secrets),
-        Ok(Some(p)) => Check::Owns(
-            p,
-            Secrets {
-                owns: true,
-                ..secrets
-            },
-        ),
+        Ok(true) => match profile(ep, token) {
+            Err(e) => Check::NoAnswer(e, secrets),
+            Ok(Some(p)) if p.uuid != account.uuid => Check::NoAnswer(OTHER_PROFILE.into(), secrets),
+            Ok(Some(p)) => Check::Owns(
+                p,
+                Secrets {
+                    owns: true,
+                    ..secrets
+                },
+            ),
+            Ok(None) => Check::Owns(
+                offline_account(Some(account)),
+                Secrets {
+                    owns: true,
+                    ..secrets
+                },
+            ),
+        },
     }
 }
 
@@ -784,9 +821,6 @@ pub enum Player {
     GameName,
 }
 
-const OFFLINE_NEEDS_OWNER: &str =
-    "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
-
 /// The secrets an account keeps in `store`, if it still has them there.
 fn secrets_in(store: &dyn SecretStore, uuid: &str) -> Option<Secrets> {
     store
@@ -866,9 +900,8 @@ impl Accounts {
         }
     }
 
-    /// Plays as `who`: an account, an offline name (kept, only beside an account that owns the
-    /// game), or the game's own name.
-    pub fn play_as(&mut self, store: &dyn SecretStore, who: Player) -> Result<(), String> {
+    /// Plays as `who`: an account, an offline name, or the game's own name.
+    pub fn play_as(&mut self, _store: &dyn SecretStore, who: Player) -> Result<(), String> {
         match who {
             Player::Microsoft(uuid) => {
                 if !self.accounts.iter().any(|a| a.uuid == uuid) {
@@ -877,9 +910,6 @@ impl Accounts {
                 self.selected = Some(uuid);
             }
             Player::Offline(name) => {
-                if !self.has_owner(store) {
-                    return Err(OFFLINE_NEEDS_OWNER.into());
-                }
                 let name = self.add_offline(&name)?;
                 self.selected = None;
                 self.offline_selected = Some(name);
@@ -944,6 +974,7 @@ impl Accounts {
     /// The game's `--name` for this run: the offline name, when one plays.
     pub fn name_arg(&self) -> Option<&str> {
         match self.selected() {
+            Some(account) if !account.has_profile => Some(&account.name),
             Some(_) => None,
             None => self.offline_selected.as_deref(),
         }
@@ -990,11 +1021,9 @@ pub struct Launch {
     pub owner: Option<(Account, Secrets)>,
 }
 
-/// The owner gate: the game starts only while an account in the launcher owns Minecraft: Java
-/// Edition. The accounts are asked again, the selected one first, until one owns it; each keeps
-/// the answer in the keychain. An account that gets no answer (no network) keeps its last one, so
-/// being offline never blocks a player who passed before, while "doesn't own" blocks at once.
-/// The caller saves `accounts` (renewed names and skins).
+/// Refreshes any signed-in accounts and returns the selected account's online session when
+/// available. No account, an expired sign-in, or a failed ownership check never blocks offline
+/// play. `owner` remains available to the resource downloader. The caller saves renewed profiles.
 pub fn launch(
     ep: &Endpoints,
     client_id: Option<&str>,
@@ -1024,7 +1053,7 @@ pub fn launch(
         let (said, secrets) = match check(ep, client_id, &account, secrets) {
             Check::Owns(renewed, secrets) => {
                 accounts.update(renewed.clone());
-                if plays {
+                if plays && renewed.has_profile {
                     pass.session = Some((renewed.clone(), secrets.clone()));
                 }
                 pass.owner = Some((renewed, secrets.clone()));
@@ -1045,11 +1074,7 @@ pub fn launch(
             }
         }
     }
-    if owned {
-        Ok(pass)
-    } else {
-        Err(NoOwner)
-    }
+    Ok(pass)
 }
 
 /// Write the session for the game, readable by this user only, in a fresh file it deletes

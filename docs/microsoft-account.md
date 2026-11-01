@@ -64,7 +64,9 @@ All requests use HTTPS and JSON except the two OAuth calls (form-encoded):
    own `game_minecraft` or `product_minecraft` (Game Pass included), else "This account doesn't own
    Minecraft Java Edition".
 7. **Profile**: `GET https://api.minecraftservices.com/minecraft/profile`: UUID, name, skins, capes.
-   404 = owns the game but has no profile yet ("Create your Minecraft profile on minecraft.net first").
+   404 = owns the game but has no profile yet. The launcher keeps a generated offline name and its
+   vanilla offline UUID in `accounts.json`; the owner gate passes, but no online session is given
+   to the game until a real profile exists.
 
 ## The owner gate
 
