@@ -1,0 +1,54 @@
+name: merge upstream
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          shared-key: ulti-upstream-sync
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/ludovic111/horizon.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_ENV"
+          fi
+      - name: Merge clean upstream changes
+        if: env.up_to_date != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # A conflict stops the job and leaves main untouched; resolve it manually.
+          git merge --no-edit upstream/main
+      - name: Install Linux libraries
+        if: env.up_to_date != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
+      - name: Test merged launcher
+        if: env.up_to_date != 'true'
+        working-directory: launcher
+        run: cargo test --release --locked
+      - name: Push merged main
+        if: env.up_to_date != 'true'
+        run: git push origin main

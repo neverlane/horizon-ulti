@@ -1,0 +1,64 @@
+name: ulti build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ulti-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            binary: horizon-launcher
+          - name: macos-arm64
+            os: macos-latest
+            binary: horizon-launcher
+          - name: windows-x64
+            os: windows-latest
+            binary: horizon-launcher.exe
+            rustflags: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      HORIZON_TELEMETRY_URL: off
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          shared-key: ulti-${{ matrix.name }}
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
+      - name: Test launcher
+        working-directory: launcher
+        run: cargo test --release --locked
+      - name: Build launcher
+        working-directory: launcher
+        run: cargo build --release --locked
+      - name: Package launcher
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "launcher/target/release/${{ matrix.binary }}" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-ulti-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
