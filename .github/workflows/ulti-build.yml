@@ -1,0 +1,86 @@
+name: ulti build
+
+# Horizon-ulti: builds the launcher on every push to main (and by hand) and keeps the
+# binaries as workflow artifacts. `upstream-sync.yml` is the only thing that pushes to
+# main, so this runs once per upstream sync.
+#
+# The launcher tests that pin the owner gate are skipped: this fork's whole point is
+# that Play never needs an owner. Everything else runs as upstream wrote it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ulti-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  # Tests that assert the owner gate refuses Play; tools/ulti/offline.py removes it.
+  GATE_TESTS: >-
+    --skip a_no_from_the_services_blocks_at_once
+    --skip any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session
+    --skip no_network_never_blocks_a_past_owner
+    --skip offline_names_play_only_beside_an_owner
+    --skip the_developer_option_off_is_the_owner_gate
+    --skip a_keyring_that_never_answers_ends_play_with_what_is_wrong
+    --skip the_cli_refuses_to_play_without_an_owner
+    --skip the_mcp_server_refuses_to_play_without_an_owner
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            binary: horizon-launcher
+          - name: macos-arm64
+            os: macos-latest
+            binary: horizon-launcher
+          - name: windows-x64
+            os: windows-latest
+            binary: horizon-launcher.exe
+            rustflags: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: launcher
+        shell: bash
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          shared-key: ulti-${{ matrix.name }}
+      - name: Linux libraries GPUI links to
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libfontconfig-dev libvulkan-dev libasound2-dev patchelf
+      - name: Test
+        run: cargo test --release --locked -- $GATE_TESTS
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p ../dist
+          cp "target/release/${{ matrix.binary }}" ../dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-ulti-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error

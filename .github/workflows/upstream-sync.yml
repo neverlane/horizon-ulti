@@ -1,0 +1,104 @@
+name: merge upstream
+
+# Horizon-ulti follows ludovic111/horizon instead of merging it: every run resets main
+# to the newest upstream commit, re-applies this fork's one change
+# (tools/ulti/offline.py: Play needs no Microsoft account), runs the launcher tests and
+# force-pushes. A source conflict therefore never happens; if upstream moves the code the
+# patch edits, the run fails and main is left as it was.
+#
+# The files this workflow needs survive the reset because they are copied out first:
+# `.github/workflows/ulti-build.yml`, `.github/workflows/upstream-sync.yml` and
+# `tools/ulti/`.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # A push made with GITHUB_TOKEN starts no workflow; the build is dispatched by hand.
+  actions: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+env:
+  HORIZON_TELEMETRY_URL: "off"
+  UPSTREAM: https://github.com/ludovic111/horizon.git
+  GATE_TESTS: >-
+    --skip a_no_from_the_services_blocks_at_once
+    --skip any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session
+    --skip no_network_never_blocks_a_past_owner
+    --skip offline_names_play_only_beside_an_owner
+    --skip the_developer_option_off_is_the_owner_gate
+    --skip a_keyring_that_never_answers_ends_play_with_what_is_wrong
+    --skip the_cli_refuses_to_play_without_an_owner
+    --skip the_mcp_server_refuses_to_play_without_an_owner
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          shared-key: ulti-upstream-sync
+      - name: Save the fork's own files
+        run: |
+          rm -rf "$RUNNER_TEMP/ulti"
+          mkdir -p "$RUNNER_TEMP/ulti/workflows"
+          cp -r tools/ulti "$RUNNER_TEMP/ulti/tools-ulti"
+          cp .github/workflows/ulti-build.yml .github/workflows/upstream-sync.yml \
+            "$RUNNER_TEMP/ulti/workflows/"
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM" 2>/dev/null || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_ENV"
+            echo "Upstream has nothing new." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Reset to upstream and re-apply offline play
+        if: env.up_to_date != 'true'
+        run: |
+          git reset --hard upstream/main
+          rm -rf tools/ulti
+          cp -r "$RUNNER_TEMP/ulti/tools-ulti" tools/ulti
+          cp "$RUNNER_TEMP/ulti/workflows/ulti-build.yml" \
+             "$RUNNER_TEMP/ulti/workflows/upstream-sync.yml" .github/workflows/
+          python3 tools/ulti/offline.py
+          git status --short
+      - name: Linux libraries GPUI links to
+        if: env.up_to_date != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libfontconfig-dev libvulkan-dev libasound2-dev patchelf
+      - name: Test the patched launcher
+        if: env.up_to_date != 'true'
+        working-directory: launcher
+        run: cargo test --release --locked -- $GATE_TESTS
+      - name: Commit and push
+        if: env.up_to_date != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Sync upstream $(git rev-parse --short upstream/main) with offline play"
+          git push --force-with-lease origin main
+          echo "Synced to $(git rev-parse --short upstream/main)." >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the synced main
+        # GITHUB_TOKEN's push never triggers `ulti build`, so start it here.
+        if: env.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "ulti build" --repo "$GITHUB_REPOSITORY" --ref main

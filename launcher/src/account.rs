@@ -1718,6 +1718,7 @@ pub enum Player {
     GameName,
 }
 
+#[allow(dead_code)] // Horizon-ulti: the gate is off, but the tests still name it.
 const OFFLINE_NEEDS_OWNER: &str =
     "Offline names need a Microsoft account that owns Minecraft: Java Edition in the launcher.";
 
@@ -1824,14 +1825,12 @@ impl Accounts {
         self.play_as_with(store, who, false)
     }
 
-    /// [`Self::play_as`], where `offline_without_owner` (the window's hidden developer option,
-    /// `backend::Settings::dev_offline`) lets an offline name play without an account that owns
-    /// the game.
+    /// [`Self::play_as`]; offline names need no account (Horizon-ulti).
     pub fn play_as_with(
         &mut self,
-        store: &dyn SecretStore,
+        _store: &dyn SecretStore,
         who: Player,
-        offline_without_owner: bool,
+        _offline_without_owner: bool,
     ) -> Result<(), String> {
         match who {
             Player::Microsoft(uuid) => {
@@ -1841,9 +1840,6 @@ impl Accounts {
                 self.selected = Some(uuid);
             }
             Player::Offline(name) => {
-                if !offline_without_owner && !self.has_owner(store) {
-                    return Err(OFFLINE_NEEDS_OWNER.into());
-                }
                 let name = self.add_offline(&name)?;
                 self.selected = None;
                 self.offline_selected = Some(name);
@@ -1995,6 +1991,7 @@ pub fn take_unsaved() -> Option<String> {
 /// the answer in the keychain. An account that gets no answer (no network) keeps its last one, so
 /// being offline never blocks a player who passed before, while "doesn't own" blocks at once.
 /// The caller saves `accounts` (renewed names and skins).
+#[allow(unused_variables, unused_assignments)] // Horizon-ulti: the owner refusal is gone.
 pub fn launch(
     ep: &Endpoints,
     client_id: Option<&str>,
@@ -2078,13 +2075,9 @@ pub fn launch(
             }
         }
     }
-    if owned {
-        Ok(pass)
-    } else {
-        Err(NoOwner {
-            keyring: unreadable,
-        })
-    }
+    // Horizon-ulti: offline play never needs an owner.
+    let _ = owned;
+    Ok(pass)
 }
 
 /// The owner gate before the game starts. With the window's hidden developer option
